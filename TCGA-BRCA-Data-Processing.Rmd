@@ -1,0 +1,94 @@
+---
+title: "TCGA-BRCA-data-processing"
+output: html_document
+date: "2026-03-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+
+## survival data analysis
+bc.survival<-data.table::fread('raw_data/TCGA-BRCA.survival.tsv')
+bc.survival<-bc.survival[grepl('01A$', bc.survival$sample),]
+```
+
+## RNA-seq expression 
+```{r}
+bc.expr<-data.table::fread('raw_data/TCGA-BRCA.htseq_fpkm.tsv')
+bc.expr$Ensembl_ID<-sapply(bc.expr$Ensembl_ID, function(x){
+  unlist(str_split(x, '\\.'))[1]
+})
+
+bc.expr<-bc.expr %>% column_to_rownames('Ensembl_ID')
+fpkm2tpm <- function(fpkm){
+  tpm <- exp(log(fpkm) - log(sum(fpkm,na.rm=T)) + log(1e6))
+  tpm[which(is.na(tpm))] <- 0
+  return(tpm)
+}
+bc.expr <- 2^bc.expr - 1
+bc.expr <- apply(bc.expr, 2, fpkm2tpm)
+bc.expr <- log2(bc.expr + 1) %>% as.data.frame()
+
+bc.normal.expr<-bc.expr[, grepl('11A$', colnames(bc.expr))]
+bc.expr<-bc.expr[, grepl('01A$', colnames(bc.expr))]
+```
+
+## Subtype information.  
+```{r}
+bc.subtype<-data.table::fread('raw_data/nationwidechildrens.org_clinical_patient_brca.txt')
+bc.subtype<-bc.subtype[3: nrow(bc.subtype),]
+bc.subtype<-bc.subtype[,c('bcr_patient_barcode', "er_status_by_ihc","pr_status_by_ihc",'her2_status_by_ihc')]
+bc.subtype<-bc.subtype %>% filter(
+  !(er_status_by_ihc %in% c('[Not Evaluated]')) & 
+    !(pr_status_by_ihc %in% c('[Not Evaluated]')) & 
+    !(her2_status_by_ihc %in% c('[Not Evaluated]','[Not Evaluated]'))
+)
+bc.subtype<-bc.subtype %>% dplyr::mutate(subtype=if_else(er_status_by_ihc == 'Negative' & 
+                                                           pr_status_by_ihc == 'Negative' & 
+                                                           her2_status_by_ihc == 'Negative','TNBC','non-TNBC'))
+## Phenotype data and survival data process
+pheno.bc<-data.table::fread('raw_data/TCGA-BRCA.GDC_phenotype.tsv')
+pheno.bc<-pheno.bc[pheno.bc$gender.demographic=='female',]
+
+sample.name<-intersect(bc.survival$sample, colnames(bc.expr)) %>% 
+  intersect(paste0(bc.subtype$bcr_patient_barcode,'-01A')) %>% 
+  intersect(pheno.bc$submitter_id.samples)
+
+pheno.bc<-pheno.bc %>% filter(submitter_id.samples %in% sample.name)
+pheno.bc<-pheno.bc[match(sample.name, pheno.bc$submitter_id.samples),]
+
+bc.survival<-bc.survival %>% filter(sample %in% sample.name)
+bc.survival<-bc.survival[match(sample.name, bc.survival$sample),]
+bc.expr<-bc.expr[, sample.name]
+bc.subtype<-bc.subtype %>% filter(bcr_patient_barcode %in% gsub('-01A','',sample.name))
+bc.subtype<-bc.subtype[match(gsub('-01A','',sample.name), bc.subtype$bcr_patient_barcode),]
+bc.subtype$sample<-paste0(bc.subtype$bcr_patient_barcode,'-01A')
+
+## only see 10-year survival of breast cancer
+bc.survival$OS.time.10<-ifelse(bc.survival$OS.time > 10*365, 10*365, bc.survival$OS.time)
+bc.survival$OS.10<-ifelse(bc.survival$OS.time > 10*365 & bc.survival$OS == 1, 0, bc.survival$OS)
+
+  
+identical(colnames(bc.expr), bc.survival$sample)
+identical(colnames(bc.expr), pheno.bc$submitter_id.samples)
+identical(gsub('-01A','',colnames(bc.expr)), bc.subtype$bcr_patient_barcode)
+rm(fpkm2tpm)
+```
+
+## PAM50 from genefu  
+```{r}
+library(genefu)
+tcga.pam50<-data.table::fread('raw_data/brca_pam50')
+tcga.pam50$bcr_patient_barcode<-gsub('-01A','', tcga.pam50$sample)
+anno<-data.frame(EntrezGene.ID=mapIds(org.Hs.eg.db, keys = rownames(bc.expr), keytype = 'ENSEMBL', column = 'ENTREZID'))
+anno$probe<-rownames(anno)
+pam50<-molecular.subtyping(sbt.model = 'pam50', data = t(bc.expr), annot = anno, do.mapping = T)
+bc.subtype$pam50<-pam50$subtype
+tcga.pam50<-left_join(tcga.pam50, bc.subtype[,c("bcr_patient_barcode","pam50")])
+table(tcga.pam50$PAM50, tcga.pam50$pam50)
+```
+

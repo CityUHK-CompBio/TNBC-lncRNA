@@ -1,0 +1,78 @@
+---
+title: "Integrative-Network-Analysis"
+output: html_notebook
+date: "2026-03-27"
+---
+
+## load in TCGA-BRCA lncRNA data
+```{r}
+lncrna.id<-data.table::fread('raw_data/gencode.v38_gene_annotation_table.txt') %>% 
+  dplyr::filter(Class== 'lncRNA')
+
+genes<-mapIds(org.Hs.eg.db, keys = rownames(bc.expr), keytype = 'ENSEMBL',column = 'SYMBOL')
+bc.expr<-bc.expr[names(genes[!is.na(genes)]),]
+rm(genes, pheno.bc)
+lncrna.id<-lncrna.id[!str_detect(lncrna.id$Geneid, 'PAR_Y'),]
+lncrna.id$gene_id<-sapply(lncrna.id$Geneid, function(x){
+  unlist(str_split(x, '\\.'))[1]
+})
+lncrna.id$gene_symbol<-mapIds(org.Hs.eg.db, keys = lncrna.id$gene_id, keytype = 'ENSEMBL',column = 'SYMBOL')
+lncrna.id<-lncrna.id[!is.na(lncrna.id$gene_symbol),]
+lncrna.id<-unique.data.frame(lncrna.id) %>% filter(Class=='lncRNA') %>% 
+  filter(gene_id %in% rownames(bc.expr))
+lnc.expr<-bc.expr[lncrna.id$gene_id,]
+bc.expr<-bc.expr[setdiff(rownames(bc.expr), lncrna.id$gene_id),]
+bc.expr<-bc.expr[apply(bc.expr, 1, mad) > 0,] %>% as.data.frame()
+lnc.expr<-lnc.expr[apply(lnc.expr, 1, mad) > 0,] %>% as.data.frame()
+```
+
+## DEG analysis for lncRNA & gene expression
+```{r}
+grp.tnbc<-if_else(bc.subtype$subtype == 'TNBC', 1, 0)
+tnbc.limma<-lmFit(object = lnc.expr, design = model.matrix(~grp.tnbc)) %>%
+  eBayes() %>% topTable(coef = 2, number = Inf, adjust.method = 'BH')
+
+mRNA.limma<-lmFit(object = bc.expr, design = model.matrix(~grp.tnbc)) %>%
+  eBayes() %>% topTable(coef = 2, number = Inf, adjust.method = 'BH')
+
+tnbc.deg<-tnbc.limma %>% filter(adj.P.Val < 0.05 & logFC > 1) %>% rownames()
+sig.mRNA<-mRNA.limma %>% filter(adj.P.Val < 0.05 & abs(logFC) > 0.5) %>% rownames()
+```
+
+## master regulator of lncRNA
+```{r}
+data4enrich <- mRNA.limma$logFC
+names(data4enrich) <- rownames(mRNA.limma)
+dbemt2 <- read_delim("raw_data/dbemt2.txt", "\t", escape_double = FALSE, trim_ws = TRUE)
+dbemt2$ensembl<-mapIds(org.Hs.eg.db, keys = dbemt2$GeneSymbol, 
+                       keytype = 'SYMBOL', column = 'ENSEMBL')
+rtni <- tni.constructor(expData = lnc.expr[tnbc.deg,] %>% t() %>% scale() %>% t() %>% as.data.frame() %>% 
+                          bind_rows(
+                            bc.expr[sig.mRNA,] %>% t() %>% scale() %>% t() %>% as.data.frame()
+                          ) %>% as.matrix(), regulatoryElements = tnbc.deg) %>% 
+  tni.permutation(nPermutations = 1000) %>% tni.bootstrap() %>% tni.dpi.filter()
+rtna <- tni2tna.preprocess(object = rtni, phenotype = data4enrich, hits = dbemt2$ensembl) %>% 
+  tna.mra() %>% tna.get(what="mra", ntop = -1)
+regulon<-rtna$Regulon[rtna$Adjusted.Pvalue < 0.05]
+rtna$Symbol <- mapIds(org.Hs.eg.db, keys = rtna$Regulon, 
+                      keytype = 'ENSEMBL', column = 'SYMBOL')
+```
+
+## Hypergeometric test significance and EMT percentage
+```{r}
+rtna %>% dplyr::select(Regulon,Regulon.Size,Observed.Hits,Adjusted.Pvalue) %>% 
+  dplyr::mutate(emt.percentage=Observed.Hits/Regulon.Size) %>% 
+  dplyr::mutate(Adjusted.Pvalue=-log10(Adjusted.Pvalue)) %>% 
+  dplyr::mutate(symbol=mapIds(org.Hs.eg.db, keys = Regulon, keytype = 'ENSEMBL', column = 'SYMBOL')) %>%
+  ggscatter(x = "emt.percentage", y = "Adjusted.Pvalue",color = 'Adjusted.Pvalue',size='emt.percentage',
+            label = "symbol", repel = TRUE,add.params=list(max.overlaps = 30))+
+  scale_color_continuous(low='blue', high='red')+
+  geom_hline(yintercept = -log10(0.05),lty='dashed',lwd=1.2)+geom_vline(xintercept = 0.2,lty='dashed',lwd=1.2)+
+  theme_classic()+labs(x='Percentage of EMT genes in regulons',y='-log10(BH-adjusted P)', 
+                       color='-log10(BH-adjusted P)',size='EMT genes (%)')+
+  theme(
+    axis.text= element_text(size=15,family ="sans"),
+    axis.title= element_text(size = 15,family ="sans")
+  )
+```
+

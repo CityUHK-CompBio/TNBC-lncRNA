@@ -1,0 +1,41 @@
+---
+title: "Multi-Uni-Cox-Analysis"
+output: html_document
+date: "2026-03-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cox analysis & KM plot of master regulator
+```{r}
+bc.survival$OS.time.10<-bc.survival$OS.time.10 / 30
+tmp.lnc<-cbind(bc.survival, t(lnc.expr[regulon,]) %>% as.data.frame())
+lnc.os.uni<-lapply(regulon, function(x){
+  res.cox<-base::eval(parse(text = sprintf('coxph(Surv(OS.time.10, OS.10) ~ %s, data=tmp.lnc)',x)))
+  return(broom::tidy(res.cox, exponentiate=T, conf.int=T))
+})%>% do.call(rbind,.)
+
+survfit(Surv(OS.time.10, OS.10) ~ type_exp, 
+        data=tmp.lnc %>% dplyr::mutate(type_exp=ifelse(ENSG00000270547 > median(ENSG00000270547), 'High', 'Low'))) %>% 
+  ggsurvplot(
+    pval = TRUE,conf.int = F,
+    risk.table = T,risk.table.col = "strata",size=1,pval.size=8,
+    xlab='Follow up (months)', ylab='Overall survival (%)',
+    legend.title = '',legend.lab=c('High', 'Low'),
+    surv.median.line = "hv",ggtheme = theme_classic2(),
+    font.x = 15,font.y=15,font.main=18,font.legend=15,font.tickslab=12,palette = "Dark1"
+  )+ggtitle('LINC01235')
+```
+
+## Expression between TNBC and non-TNBC 
+```{r}
+tmp.lnc %>% bind_cols(bc.subtype[,c('TNBC.Basal')]) %>% 
+  ggboxplot(x = "TNBC.Basal", y = regulon, color = "TNBC.Basal", palette = 'Dark2',
+            title='', width = 0.2, lwd=1.2, add = "jitter")+
+  stat_compare_means(method = "t.test", label = "p.format",comparisons = list(c('TNBC-Basal','non-TNBC-Basal'), c('TNBC-Basal','non-TNBC')))+
+  labs(x='',y=paste0('LINC01235 expression'), title = 'LINC01235')+
+  theme(legend.position = 'none')
+```
+
